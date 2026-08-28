@@ -27,4 +27,7 @@ arctechture` is a lightweight, high-performance command-line utility built in Go
    ```bash
    cd arctechture
 
+
+   export GEMINI_API_KEYS="your_key_1,your_key_2,your_key_3"
+
    go run main.go scan .
