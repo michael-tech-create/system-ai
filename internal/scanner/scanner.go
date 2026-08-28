@@ -10,13 +10,19 @@
 package scanner
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 )
+
+// DefaultMaxFiles caps how many Go files are included in a summary so
+// large monorepos cannot blow the LLM context window unnoticed.
+const DefaultMaxFiles = 2000
 
 // FileSummary holds everything the LLM needs to reason about one Go file,
 // without including the actual source code.
@@ -24,7 +30,7 @@ type FileSummary struct {
 	Path      string   `json:"path"`       // relative path from project root
 	Package   string   `json:"package"`    // declared package name
 	Imports   []string `json:"imports"`    // import paths used by this file
-	Functions []string `json:"functions"`  // top-level function names
+	Functions []string `json:"functions"`  // top-level funcs; methods as Type.Method
 	Types     []string `json:"types"`      // top-level type/struct names
 	Lines     int      `json:"line_count"` // rough size signal
 }
@@ -33,6 +39,8 @@ type FileSummary struct {
 type ProjectSummary struct {
 	RootPath string        `json:"root_path"`
 	Files    []FileSummary `json:"files"`
+	Warnings []string      `json:"warnings,omitempty"`
+	Truncated bool         `json:"truncated,omitempty"`
 }
 
 // dirsToSkip are directories we never want to walk into. Vendored code,
@@ -43,20 +51,51 @@ var dirsToSkip = map[string]bool{
 	"node_modules": true,
 	"dist":         true,
 	"build":        true,
+	"bin":          true,
+	"testdata":     true,
+	"third_party":  true,
 	".idea":        true,
 	".vscode":      true,
 }
 
+// Options controls scan behavior.
+type Options struct {
+	// MaxFiles limits how many .go files are kept (0 = DefaultMaxFiles).
+	MaxFiles int
+}
+
 // ScanProject walks rootPath and returns a structural summary of every
-// .go file it finds. Errors on individual files are collected but don't
-// stop the scan — a single malformed file shouldn't block analysis of
-// the rest of the project.
+// .go file it finds. Errors on individual files are collected as warnings
+// and do not stop the scan — a single malformed file shouldn't block
+// analysis of the rest of the project.
 func ScanProject(rootPath string) (*ProjectSummary, error) {
+	return ScanProjectWithOptions(rootPath, Options{})
+}
+
+// ScanProjectWithOptions is like ScanProject but accepts scan limits.
+func ScanProjectWithOptions(rootPath string, opts Options) (*ProjectSummary, error) {
+	info, err := os.Stat(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("project path: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("project path is not a directory: %s", rootPath)
+	}
+
+	maxFiles := opts.MaxFiles
+	if maxFiles <= 0 {
+		maxFiles = DefaultMaxFiles
+	}
+
 	summary := &ProjectSummary{RootPath: rootPath}
 
-	err := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			// Skip files we can't even stat, but keep scanning the rest.
+	err = filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			summary.Warnings = append(summary.Warnings,
+				fmt.Sprintf("skip %s: %v", path, walkErr))
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -72,28 +111,45 @@ func ScanProject(rootPath string) (*ProjectSummary, error) {
 		}
 		// Skip generated/test files for v1 — they'd add noise to the
 		// architecture picture without adding much signal.
-		if strings.HasSuffix(path, "_test.go") {
+		base := filepath.Base(path)
+		if strings.HasSuffix(base, "_test.go") {
+			return nil
+		}
+		if strings.HasPrefix(base, ".") {
 			return nil
 		}
 
-		fs, parseErr := parseGoFile(path)
+		if len(summary.Files) >= maxFiles {
+			summary.Truncated = true
+			return fs.SkipAll
+		}
+
+		fileSum, parseErr := parseGoFile(path)
 		if parseErr != nil {
-			// A file that fails to parse (syntax error, etc.) is still
-			// worth reporting on later — for now we just skip it rather
-			// than aborting the whole scan.
+			rel := path
+			if r, relErr := filepath.Rel(rootPath, path); relErr == nil {
+				rel = r
+			}
+			summary.Warnings = append(summary.Warnings,
+				fmt.Sprintf("parse %s: %v", rel, parseErr))
 			return nil
 		}
 
 		relPath, relErr := filepath.Rel(rootPath, path)
 		if relErr == nil {
-			fs.Path = relPath
+			fileSum.Path = relPath
+		} else {
+			fileSum.Path = path
 		}
 
-		summary.Files = append(summary.Files, *fs)
+		summary.Files = append(summary.Files, *fileSum)
 		return nil
 	})
+	if err != nil {
+		return summary, fmt.Errorf("walk project: %w", err)
+	}
 
-	return summary, err
+	return summary, nil
 }
 
 // parseGoFile extracts a structural summary from a single Go source file
@@ -108,13 +164,13 @@ func parseGoFile(path string) (*FileSummary, error) {
 		return nil, err
 	}
 
-	fs := &FileSummary{
+	fileSum := &FileSummary{
 		Package: node.Name.Name,
 	}
 
 	for _, imp := range node.Imports {
 		// imp.Path.Value includes the surrounding quotes, e.g. `"fmt"`.
-		fs.Imports = append(fs.Imports, strings.Trim(imp.Path.Value, `"`))
+		fileSum.Imports = append(fileSum.Imports, strings.Trim(imp.Path.Value, `"`))
 	}
 
 	// Walk top-level declarations to pull out function and type names.
@@ -123,11 +179,11 @@ func parseGoFile(path string) (*FileSummary, error) {
 	for _, decl := range node.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
-			fs.Functions = append(fs.Functions, d.Name.Name)
+			fileSum.Functions = append(fileSum.Functions, funcName(d))
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
 				if ts, ok := spec.(*ast.TypeSpec); ok {
-					fs.Types = append(fs.Types, ts.Name.Name)
+					fileSum.Types = append(fileSum.Types, ts.Name.Name)
 				}
 			}
 		}
@@ -135,7 +191,40 @@ func parseGoFile(path string) (*FileSummary, error) {
 
 	// Line count from the fset gives us a cheap size signal without
 	// re-reading the file.
-	fs.Lines = fset.Position(node.End()).Line
+	fileSum.Lines = fset.Position(node.End()).Line
 
-	return fs, nil
+	return fileSum, nil
+}
+
+// funcName formats a function or method for the summary.
+// Methods include the receiver type: "T.Method" or "*T.Method".
+func funcName(d *ast.FuncDecl) string {
+	if d.Recv == nil || len(d.Recv.List) == 0 {
+		return d.Name.Name
+	}
+
+	recv := recvTypeName(d.Recv.List[0].Type)
+	if recv == "" {
+		return d.Name.Name
+	}
+	return recv + "." + d.Name.Name
+}
+
+func recvTypeName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		inner := recvTypeName(t.X)
+		if inner == "" {
+			return ""
+		}
+		return "*" + inner
+	case *ast.IndexExpr:
+		return recvTypeName(t.X)
+	case *ast.IndexListExpr:
+		return recvTypeName(t.X)
+	default:
+		return ""
+	}
 }

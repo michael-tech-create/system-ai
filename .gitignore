@@ -1,1 +1,6 @@
 .env
+arctechture
+*.exe
+*.test
+/bin/
+/dist/
